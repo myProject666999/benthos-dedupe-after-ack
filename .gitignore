@@ -12,3 +12,9 @@ release_notes.md
 .task
 .op
 benthos
+.env
+.env.*
+*.pem
+*.key
+secrets/
+*.token

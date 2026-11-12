@@ -34,6 +34,7 @@ type Manager struct {
 
 	Inputs          map[string]*Input
 	Caches          map[string]map[string]CacheItem
+	customCaches    map[string]cache.V1
 	RateLimits      map[string]RateLimit
 	Outputs         map[string]OutputWriter
 	Processors      map[string]Processor
@@ -59,6 +60,7 @@ func NewManager() *Manager {
 		Version:         "mock",
 		Inputs:          map[string]*Input{},
 		Caches:          map[string]map[string]CacheItem{},
+		customCaches:    map[string]cache.V1{},
 		RateLimits:      map[string]RateLimit{},
 		Outputs:         map[string]OutputWriter{},
 		Processors:      map[string]Processor{},
@@ -197,8 +199,20 @@ func (m *Manager) ProbeCache(name string) bool {
 	m.lock.Lock()
 	defer m.lock.Unlock()
 
+	if _, exists := m.customCaches[name]; exists {
+		return true
+	}
 	_, exists := m.Caches[name]
 	return exists
+}
+
+// RegisterCacheForTest registers a custom cache.V1 implementation under the
+// provided name. It is intended for tests that need TTL semantics or a
+// programmable cache implementation rather than the map backed mock.
+func (m *Manager) RegisterCacheForTest(name string, c cache.V1) {
+	m.lock.Lock()
+	defer m.lock.Unlock()
+	m.customCaches[name] = c
 }
 
 // AccessCache executes a closure on a cache resource.
@@ -206,6 +220,10 @@ func (m *Manager) AccessCache(ctx context.Context, name string, fn func(cache.V1
 	m.lock.Lock()
 	defer m.lock.Unlock()
 
+	if c, ok := m.customCaches[name]; ok {
+		fn(c)
+		return nil
+	}
 	values, ok := m.Caches[name]
 	if !ok {
 		return component.ErrCacheNotFound
@@ -219,6 +237,10 @@ func (m *Manager) RemoveCache(ctx context.Context, name string) error {
 	m.lock.Lock()
 	defer m.lock.Unlock()
 
+	if _, exists := m.customCaches[name]; exists {
+		delete(m.customCaches, name)
+		return nil
+	}
 	_, exists := m.Caches[name]
 	if !exists {
 		return component.ErrCacheNotFound

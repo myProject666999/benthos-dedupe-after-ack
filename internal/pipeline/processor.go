@@ -8,6 +8,7 @@ import (
 
 	"github.com/Jeffail/shutdown"
 
+	"github.com/redpanda-data/benthos/v4/internal/ackhooks"
 	"github.com/redpanda-data/benthos/v4/internal/batch"
 	"github.com/redpanda-data/benthos/v4/internal/component"
 	"github.com/redpanda-data/benthos/v4/internal/component/processor"
@@ -81,8 +82,35 @@ func (p *Processor) loop() {
 
 		sorter, sortBatch := message.NewSortGroup(tran.Payload)
 
+		// Attach a sink that processors such as dedupe use to register
+		// acknowledgement entries. Because the AutoObserved processor wrapper
+		// restores pre-processing contexts onto output parts, entries cannot be
+		// propagated on the parts themselves; the sink is instead settled
+		// directly here when the source transaction reaches its final outcome.
+		sink := ackhooks.NewSink(sorter, sortBatch)
+		_ = sortBatch.Iter(func(i int, p *message.Part) error {
+			sortBatch[i] = message.WithContext(ackhooks.WithSink(message.GetContext(p), sink), p)
+			return nil
+		})
+
+		// settleSink resolves every registered entry with the transaction's
+		// final delivery error. It is idempotent so it is safe to invoke from
+		// both the filtered/error branch and the normal acknowledgement path.
+		sinkSettled := false
+		settleSink := func(ackErr error) {
+			if sinkSettled {
+				return
+			}
+			sinkSettled = true
+			sink.ResolveAll(ackErr)
+		}
+
 		resultBatches, err := processor.ExecuteAll(closeNowCtx, p.msgProcessors, sortBatch)
 		if len(resultBatches) == 0 || err != nil {
+			// An empty result means every message was deliberately filtered,
+			// which counts as a successful outcome for the registered entries;
+			// an execution error must instead be retried.
+			settleSink(err)
 			if _ = tran.Ack(closeNowCtx, err); closeNowCtx.Err() != nil {
 				return
 			}
@@ -91,7 +119,10 @@ func (p *Processor) loop() {
 
 		if len(resultBatches) == 1 {
 			select {
-			case p.messagesOut <- message.NewTransactionFunc(resultBatches[0], tran.Ack):
+			case p.messagesOut <- message.NewTransactionFunc(resultBatches[0], func(ctx context.Context, ackErr error) error {
+				settleSink(ackErr)
+				return tran.Ack(ctx, ackErr)
+			}):
 			case <-p.shutSig.HardStopChan():
 				return
 			}
@@ -144,10 +175,13 @@ func (p *Processor) loop() {
 		batchWG.Wait()
 
 		if generalErr != nil {
+			settleSink(generalErr)
 			_ = tran.Ack(closeNowCtx, generalErr)
 		} else if batchErr != nil {
+			settleSink(batchErr)
 			_ = tran.Ack(closeNowCtx, batchErr)
 		} else {
+			settleSink(nil)
 			_ = tran.Ack(closeNowCtx, nil)
 		}
 	}
@@ -174,6 +208,14 @@ func (p *Processor) TransactionChan() <-chan message.Transaction {
 // TriggerCloseNow signals that the processor pipeline should close immediately.
 func (p *Processor) TriggerCloseNow() {
 	p.shutSig.TriggerHardStop()
+}
+
+// NoCloseProcessorsForTest prevents the pipeline from closing the processors
+// that were shared with another pipeline (or managed externally), mirroring the
+// behaviour used by NewPool. It is intended for tests that drive a pipeline
+// directly.
+func (p *Processor) NoCloseProcessorsForTest() {
+	p.noCloseProcs = true
 }
 
 // WaitForClose blocks until the component has closed down or the context is
